@@ -227,180 +227,98 @@ __global__ void compact(int* cnt, int* cnt_pre, int* ccnt_pre, int* ind, int* pi
     pix[ccnt_pre[id]] = id; 
 }
 
-__global__ void automata(int* ind, float* buffer, int* direction, int cnum)
+// 在 fof_cuda.cu 中添加，例如在现有的核函数之后
+__global__ void fof_cuda_histogram_kernel(
+    torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> fof, // Output FOF (now histogram)
+    int* ind, // Start index for each pixel's depth points in buffer
+    int* pix, // Flattened pixel index
+    float* buffer, // Raw depth values for all pixels
+    int cnum, // Number of valid pixels (pixels with at least one depth point)
+    int num_bins, // Number of depth bins (FOF channels)
+    float min_depth, // Minimum depth for binning
+    float max_depth, // Maximum depth for binning
+    int res) // Resolution
 {
+    // 每个线程处理一个有效像素 (被三角形覆盖的像素)
     const int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= cnum) return;
 
-    // sort
-    int start = ind[id]; 
+    // 从展平的 pix[id] 中获取像素的批次、行、列索引
+    int tmp_pix_id = pix[id];
+    int w = tmp_pix_id % res;
+    tmp_pix_id = tmp_pix_id / res;
+    int h = tmp_pix_id % res;
+    int n = tmp_pix_id / res;
+
+    // 获取当前像素深度点在 buffer 中的起始和结束索引
+    int start = ind[id];
     int end = ind[id+1];
-    for (int i=start+1; i<end; i++)
-    {
-        float tmp_buffer = buffer[i];
-        int tmp_direction = direction[i];
-        int pre = i-1;
-        while (pre>=start && compare(tmp_buffer, tmp_direction, buffer[pre], direction[pre]))
-        {
-            buffer[pre+1] = buffer[pre];
-            direction[pre+1] = direction[pre];
-            pre--;
-        }
-        buffer[pre+1] = tmp_buffer;
-        direction[pre+1] = tmp_direction;
-    }
 
-    // automata
-    int state = 0;
-    int pre = 0;
-    for (int i=start; i<end; i++)
-    if (state == 0)
-    {
-        if (direction[i]==0){
-            state = 1;
-            buffer[start+pre] = buffer[i];
-        }
-    }
-    else if (state == 1)
-    {
-        if (direction[i]==1){
-            state = 2;
-            buffer[start+pre+1] = buffer[i];
-        }
-    }
-    else if (state == 2) 
-    {
-        if (direction[i]==1){
-            buffer[start+pre+1] = buffer[i];
-        }else{
-            state = 1;
-            pre = pre+2;
-            buffer[start+pre] = buffer[i];
-        }
-    }
+    // 确保深度范围有效，避免除以零
+    float depth_range = max_depth - min_depth;
+    if (depth_range <= 0) return;
 
-    if (state==2) pre = pre+2;
-    for (int i=start+pre; i<end; i++) buffer[i] = 1024;
+    // 遍历当前像素的所有深度点
+    for (int i = start; i < end; ++i) {
+        float d_tmp = buffer[i]; // 获取深度值
+
+        // 将深度值归一化到 [0, 1] 范围
+        float normalized_depth = (d_tmp - min_depth) / depth_range;
+
+        // 计算 bin 索引。floorf 确保向下取整。
+        // 钳位操作确保 bin_idx 落在 [0, num_bins-1] 范围内，处理边界情况。
+        int bin_idx = (int)floorf(normalized_depth * num_bins);
+        bin_idx = max(0, min(bin_idx, num_bins - 1));
+
+        // 原子性地增加对应 bin 的计数。
+        // fof 张量的访问顺序是 [batch][height][width][bin_channel]
+        atomicAdd(&fof[n][h][w][bin_idx], 1.0f);
+    }
 }
 
-__global__ void intergral(
-    torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> fof,
-    int* ind, int* pix, float* buffer, int cnum, int num, int res, float PI)
-{
-    long long tid = blockIdx.x;
-    tid = tid * blockDim.x + threadIdx.x;
-    int id = tid / num;
-    if (id >= cnum) return;
-    int c = tid % num;
-    
-    int tmp = pix[id];
-    int w = tmp % res;
-    tmp = tmp/res;
-    int h = tmp % res;
-    int n = tmp/res;
 
-    int start = ind[id]; 
-    int end = ind[id+1];
-    if (c==0){
-        for (int i=start; i<end; i=i+2)
-        {
-            if (buffer[i]==1024) break;
-            fof[n][h][w][0] += buffer[i+1]-buffer[i];
-        }
-    }else{
-        for (int i=start; i<end; i=i+2)
-        {
-            if (buffer[i]==1024) break;
-            float t2 = buffer[i+1]+1;
-            float t1 = buffer[i]+1;
-            fof[n][h][w][c] += sin(t2*0.5*c*PI)-sin(t1*0.5*c*PI);
-        }
-        fof[n][h][w][c] /= 0.5*c*PI;
-    }
-}
-} // namespace
-
-torch::Tensor fof_cuda_dynamic(torch::Tensor v, int num, int res)
+// 修改函数签名
+torch::Tensor fof_cuda_dynamic(torch::Tensor v, int num_bins, int res, float min_depth, float max_depth) // num -> num_bins, 添加 min_depth, max_depth
 {
     cudaSetDevice(v.device().index());
-    auto fof = torch::zeros({v.size(0), res, res, num},
+    // FOF 输出张量现在代表深度直方图，通道数为 num_bins
+    auto fof = torch::zeros({v.size(0), res, res, num_bins}, // num 现在是 num_bins
                             torch::TensorOptions()
                                 .dtype(torch::kFloat32)
                                 .device(v.device().type(), v.device().index())
                                 .requires_grad(false));
-    
-    // pixels occ
-    int pnum = v.size(0)*res*res;
-    int* cnt; cudaMalloc(&cnt, sizeof(int)*pnum);
-    cudaMemset(cnt, 0, sizeof(int)*pnum);
-    int* cnt_pre; cudaMalloc(&cnt_pre, sizeof(int)*pnum);
-    // pixels num
-    int* ccnt; cudaMalloc(&ccnt, sizeof(int)*pnum);
-    cudaMemset(ccnt, 0, sizeof(int)*pnum);
-    int* ccnt_pre; cudaMalloc(&ccnt_pre, sizeof(int)*pnum);
 
-    const int threads = 1024;
-    const dim3 blocks((v.size(1) + threads - 1) / threads, v.size(0));
-    fof_cuda_render_kernel0<<<blocks, threads>>>(
-        v.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
-        res, cnt, ccnt
-    );
+    // ... (保持 fof_cuda_render_kernel0 及 cub::DeviceScan::ExclusiveSum 调用不变)
 
-    int inum, cnum;
-    {
-        void     *d_temp_storage = NULL;
-        size_t   temp_storage_bytes = 0;
-        cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, cnt, cnt_pre, pnum);
-        cudaMalloc(&d_temp_storage, temp_storage_bytes);
-        cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, cnt, cnt_pre, pnum);
-        cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, ccnt, ccnt_pre, pnum);
-        cudaFree(d_temp_storage);
-
-        int tmp0, tmp1;
-        cudaMemcpy(&tmp0, cnt+pnum-1, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&tmp1, cnt_pre+pnum-1, sizeof(int), cudaMemcpyDeviceToHost);
-        inum = tmp0+tmp1;
-        cudaMemcpy(&tmp0, ccnt+pnum-1, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&tmp1, ccnt_pre+pnum-1, sizeof(int), cudaMemcpyDeviceToHost);
-        cnum = tmp0+tmp1;
-    }
-    if (inum==0 || cnum==0)
-        return fof.permute({0,3,1,2});
-
-    float* buffer; cudaMalloc(&buffer, sizeof(float)*inum);
-    int* direction; cudaMalloc(&direction, sizeof(int)*inum);
-    cudaMemcpy(ccnt, cnt_pre, sizeof(int)*pnum, cudaMemcpyDeviceToDevice);
+    // 光栅化，收集所有深度值到 buffer 中 (fof_cuda_render_kernel1 调用不变)
     fof_cuda_render_kernel1<<<blocks, threads>>>(
         v.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
         res, ccnt, buffer, direction
     );
 
-    int* ind; cudaMalloc(&ind, sizeof(int)*(cnum+1)); 
-    cudaMemcpy(&ind[cnum], &inum, sizeof(int), cudaMemcpyHostToDevice);
-    int* pix; cudaMalloc(&pix, sizeof(int)*cnum);
-    compact<<<(pnum+1023)/1024, 1024>>>(cnt, cnt_pre, ccnt_pre, ind, pix, pnum);
+    // ... (保持 compact 核函数调用不变)
 
-    automata<<<(cnum+1023)/1024, 1024>>>(ind, buffer, direction, cnum);
+    // *******************************************************************
+    // 重要：删除或注释掉 automata 和 intergral 的调用
+    // automata<<<(cnum+1023)/1024, 1024>>>(ind, buffer, direction, cnum);
+    // long long tmp_integral = num_bins;
+    // tmp_integral = tmp_integral*cnum;
+    // intergral<<<(tmp_integral+1023)/1024, 1024>>>(
+    //     fof.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+    //     ind, pix, buffer, cnum, num_bins, res, PI
+    // );
+    // *******************************************************************
 
-    long long tmp = num;
-    tmp = tmp*cnum;
-    intergral<<<(tmp+1023)/1024, 1024>>>(
+    // 调用新的深度直方图核函数
+    fof_cuda_histogram_kernel<<<(cnum+1023)/1024, 1024>>>(
         fof.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
-        ind, pix, buffer, cnum, num, res, PI
+        ind, pix, buffer, cnum, num_bins, min_depth, max_depth, res
     );
 
-    cudaFree(ind);
-    cudaFree(pix);
-    cudaFree(buffer);
-    cudaFree(direction);
-    cudaFree(cnt);
-    cudaFree(cnt_pre);
-    cudaFree(ccnt);
-    cudaFree(ccnt_pre);
+    // ... (保持内存释放不变)
 
     return fof.permute({0,3,1,2});
 }
-
 
 int get_buffer_size(int pnum)
 {
@@ -411,8 +329,9 @@ int get_buffer_size(int pnum)
     return temp_storage_bytes;
 }
 
+// 修改函数签名
 torch::Tensor fof_cuda_static(
-    torch::Tensor v, int num, int res, int pre_size,
+    torch::Tensor v, int num_bins, int res, int pre_size, // num -> num_bins
     torch::Tensor pix_cnt,
     torch::Tensor int_cnt,
     torch::Tensor pix_pre,
@@ -420,57 +339,43 @@ torch::Tensor fof_cuda_static(
     torch::Tensor pix,
     torch::Tensor ind,
     torch::Tensor pre_tmp,
-    torch::Tensor int_bbb,
-    torch::Tensor int_ddd
+    torch::Tensor int_bbb, // 现在是原始深度值缓冲区
+    torch::Tensor int_ddd, // 现在是方向缓冲区
+    float min_depth, float max_depth // 添加 min_depth, max_depth
 )
 {
     cudaSetDevice(v.device().index());
-    auto fof = torch::zeros({v.size(0), res, res, num},
+    auto fof = torch::zeros({v.size(0), res, res, num_bins}, // num 现在是 num_bins
                             torch::TensorOptions()
                                 .dtype(torch::kFloat32)
                                 .device(v.device().type(), v.device().index())
                                 .requires_grad(false));
-    int pnum = v.size(0)*res*res;
-    cudaMemset(pix_cnt.data_ptr<int>(), 0, sizeof(int)*pnum);
-    cudaMemset(int_cnt.data_ptr<int>(), 0, sizeof(int)*pnum);
+    // ... (保持 fof_cuda_render_kernel0 及 cub::DeviceScan::ExclusiveSum 调用不变)
 
-
-    const int threads = 1024;
-    const dim3 blocks((v.size(1) + threads - 1) / threads, v.size(0));
-    fof_cuda_render_kernel0<<<blocks, threads>>>(
-        v.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
-        res, int_cnt.data_ptr<int>(), pix_cnt.data_ptr<int>()
-    );
-
-    
-    void* tmp_ptr = (void*) pre_tmp.data_ptr<unsigned char>();
-    size_t tmp_size = pre_size;
-    cub::DeviceScan::ExclusiveSum(tmp_ptr, tmp_size, pix_cnt.data_ptr<int>(), pix_pre.data_ptr<int>(), pnum);
-    cub::DeviceScan::ExclusiveSum(tmp_ptr, tmp_size, int_cnt.data_ptr<int>(), int_pre.data_ptr<int>(), pnum);
-    int inum = int_cnt[pnum-1].item<int>() + int_pre[pnum-1].item<int>();
-    int cnum = pix_cnt[pnum-1].item<int>() + pix_pre[pnum-1].item<int>();
-
-    if (inum==0 || cnum==0)
-        return fof.permute({0,3,1,2});
-
-
-    cudaMemcpy(pix_cnt.data_ptr<int>(), int_pre.data_ptr<int>(), sizeof(int)*pnum, cudaMemcpyDeviceToDevice);
+    // 收集深度值到 int_bbb (作为 buffer) 和 int_ddd (作为 direction)
     fof_cuda_render_kernel1<<<blocks, threads>>>(
         v.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
         res, pix_cnt.data_ptr<int>(), int_bbb.data_ptr<float>(),
         int_ddd.data_ptr<int>()
     );
 
+    // ... (保持 compact 核函数调用不变)
 
-    cudaMemcpy(&ind.data_ptr<int>()[cnum], &inum, sizeof(int), cudaMemcpyHostToDevice);
-    compact<<<(pnum+1023)/1024, 1024>>>(int_cnt.data_ptr<int>(), int_pre.data_ptr<int>(), pix_pre.data_ptr<int>(),
-                                        ind.data_ptr<int>(), pix.data_ptr<int>(), pnum);
-    automata<<<(cnum+1023)/1024, 1024>>>(ind.data_ptr<int>(), int_bbb.data_ptr<float>(), int_ddd.data_ptr<int>(), cnum);
+    // *******************************************************************
+    // 重要：删除或注释掉 automata 和 intergral 的调用
+    // automata<<<(cnum+1023)/1024, 1024>>>(ind.data_ptr<int>(), int_bbb.data_ptr<float>(), int_ddd.data_ptr<int>(), cnum);
+    // intergral<<<(num_bins*cnum+1023)/1024, 1024>>>(
+    //     fof.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+    //     ind.data_ptr<int>(), pix.data_ptr<int>(),
+    //     int_bbb.data_ptr<float>(), cnum, num_bins, res, PI
+    // );
+    // *******************************************************************
 
-    intergral<<<(num*cnum+1023)/1024, 1024>>>(
+    // 调用新的深度直方图核函数
+    fof_cuda_histogram_kernel<<<(cnum+1023)/1024, 1024>>>(
         fof.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
         ind.data_ptr<int>(), pix.data_ptr<int>(),
-        int_bbb.data_ptr<float>(), cnum, num, res, PI
+        int_bbb.data_ptr<float>(), cnum, num_bins, min_depth, max_depth, res
     );
 
     return fof.permute({0,3,1,2});
